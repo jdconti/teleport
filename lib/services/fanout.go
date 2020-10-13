@@ -147,8 +147,9 @@ func (f *Fanout) Emit(events ...Event) {
 	}
 }
 
-// Reset closes all attached watchers and places the
-// fanout back into an uninitialized state.
+// Reset closes all attached watchers and places the fanout instance
+// into an uninitialized state.  Reset may be called on an uninitialized
+// fanout instance to remove "queued" watchers.
 func (f *Fanout) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -156,6 +157,8 @@ func (f *Fanout) Reset() {
 	f.init = false
 }
 
+// Close permanently closes the the fanout.  Existing watchers will be
+// closed and no new watchers will be added.
 func (f *Fanout) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()

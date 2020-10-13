@@ -30,7 +30,8 @@ import (
 // of resources updates
 type collection interface {
 	// fetch fetches resources and returns a function which
-	// will apply said resources to the cache.
+	// will apply said resources to the cache.  fetch *must*
+	// not mutate cache state outside of the apply function.
 	fetch(ctx context.Context) (apply func() error, err error)
 	// process processes event
 	processEvent(ctx context.Context, e services.Event) error

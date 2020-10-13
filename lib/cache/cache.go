@@ -109,10 +109,16 @@ type Cache struct {
 	// Entry is a logging entry
 	*log.Entry
 
-	// rw is a read-wright lock used to ensure that reads and
-	// resets do not overlap.
+	// rw is used to prevent reads of invalid cache states.  From a
+	// memory-safety perspective, this RWMutex is just used to protect
+	// the `ok` field.  *However*, cache reads must hold the read lock
+	// for the duration of the read, not just when checking the `ok`
+	// field.  Since the write lock must be held in order to modify
+	// the `ok` field, this serves to ensure that all in-progress reads
+	// complete *before* a reset can begin.
 	rw sync.RWMutex
 	// ok indicates whether the cache is in a valid state for reads.
+	// If `ok` is `false`, reads are forwarded directly to the backend.
 	ok bool
 
 	// initOnce protects initC and initErr.
@@ -150,28 +156,25 @@ type Cache struct {
 	closedFlag int32
 }
 
-func (c *Cache) setInit(err error) {
+func (c *Cache) setInitError(err error) {
 	c.initOnce.Do(func() {
 		c.initErr = err
 		close(c.initC)
 	})
 }
 
-type readGuard struct {
-	trust         services.Trust
-	clusterConfig services.ClusterConfiguration
-	provisioner   services.Provisioner
-	users         services.UsersService
-	access        services.Access
-	dynamicAccess services.DynamicAccess
-	presence      services.Presence
-	release       func()
-}
-
-func (r *readGuard) Release() {
-	if r.release != nil {
-		r.release()
+// setReadOK updates Cache.ok, which determines whether the
+// cache is accessible for reads.
+func (c *Cache) setReadOK(ok bool) {
+	c.rw.RLock()
+	current := c.ok
+	c.rw.RUnlock()
+	if current == ok {
+		return
 	}
+	c.rw.Lock()
+	c.ok = ok
+	c.rw.Unlock()
 }
 
 // read acquires the cache rw lock and selects the appropriate
@@ -206,8 +209,27 @@ func (c *Cache) read() (readGuard, error) {
 	}, nil
 }
 
+type readGuard struct {
+	trust         services.Trust
+	clusterConfig services.ClusterConfiguration
+	provisioner   services.Provisioner
+	users         services.UsersService
+	access        services.Access
+	dynamicAccess services.DynamicAccess
+	presence      services.Presence
+	release       func()
+}
+
+func (r *readGuard) Release() {
+	if r.release != nil {
+		r.release()
+	}
+}
+
 // Config defines cache configuration parameters
 type Config struct {
+	// target is an identifying string that allows errors to
+	// indicate the target presets used (e.g. "auth).
 	target string
 	// Context is context for parent operations
 	Context context.Context
@@ -413,18 +435,6 @@ func (c *Cache) setClosed() {
 	atomic.StoreInt32(&c.closedFlag, 1)
 }
 
-func (c *Cache) setReadOK(ok bool) {
-	c.rw.RLock()
-	current := c.ok
-	c.rw.RUnlock()
-	if current == ok {
-		return
-	}
-	c.rw.Lock()
-	c.ok = ok
-	c.rw.Unlock()
-}
-
 func (c *Cache) update(ctx context.Context) {
 	defer c.Close()
 	retry, err := utils.NewLinear(utils.LinearConfig{
@@ -437,7 +447,7 @@ func (c *Cache) update(ctx context.Context) {
 	}
 	for {
 		err := c.fetchAndWatch(ctx, retry)
-		c.setInit(err)
+		c.setInitError(err)
 		if err != nil && !c.isClosed() {
 			c.Warningf("Re-init the cache on error: %v.", trace.Unwrap(err))
 			if c.OnlyRecent.Enabled {
@@ -569,12 +579,19 @@ func (c *Cache) fetchAndWatch(ctx context.Context, retry utils.Retry) error {
 		return trace.Wrap(err)
 	}
 
+	// apply was successful; cache is now readable.
 	c.setReadOK(true)
-	c.setInit(nil)
+	c.setInitError(nil)
+
 	// watchers have been queuing up since the last time
 	// the cache was in a healthy state; broadcast OpInit.
+	// It is very important that OpInit is not broadcast until
+	// after we've placed the cache into a readable state.  This ensures
+	// that any derivative caches do not peform their fetch operations
+	// until this cache has finished its apply operations.
 	c.eventsFanout.SetInit()
 	defer c.eventsFanout.Reset()
+
 	retry.Reset()
 	c.notify(CacheEvent{Type: WatcherStarted})
 	for {
