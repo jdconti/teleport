@@ -1989,10 +1989,10 @@ func (h *Handler) validateTrustedCluster(w http.ResponseWriter, r *http.Request,
 
 	validateResponse, err := h.auth.ValidateTrustedCluster(validateRequest)
 	if err != nil {
+		log.Errorf("failed validating trusted cluster: %v", err)
 		if trace.IsAccessDenied(err) {
 			return nil, trace.AccessDenied("access denied: the cluster token has been rejected")
 		}
-		log.Error(err)
 		return nil, trace.Wrap(err)
 	}
 
